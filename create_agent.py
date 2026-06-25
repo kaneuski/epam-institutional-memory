@@ -4,21 +4,22 @@ Provision everything this track needs in one shot:
   2. A Managed Agent with the full agent toolset + those skills
   3. A cloud Environment (the container the agent runs in)
   4. A Memory Store that survives across sessions
-  5. A bootstrap session that writes KB tooling into /mnt/memory/ and scaffolds
-     the 12 register files at /mnt/memory/.registers/
+  5. Direct API seeding of KB tooling + 12 register files into the store
+
+The memory store "Institutional Memory" mounts at:
+  /mnt/memory/Institutional Memory/
 
 After this script completes the agent's memory store contains:
-  /mnt/memory/scaffold-registers.py
-  /mnt/memory/kb-register-schema.md
-  /mnt/memory/tools/kb-lint.py
-  /mnt/memory/tools/kb-browser.py
-  /mnt/memory/.registers/  (12 empty register files)
+  /kb-register-schema.md
+  /tools/scaffold-registers.py
+  /tools/kb-lint.py
+  /tools/kb-browser.py
+  /.registers/  (12 empty register files)
 
-run_session_*.py scripts can then assume the workspace is ready and focus
-purely on ingestion and Q&A.
+Agents see these under /mnt/memory/Institutional Memory/<path>.
 
-Re-running is idempotent: existing dotfiles are reused, the bootstrap session
-is skipped if .bootstrap_done exists.
+Re-running is idempotent: existing dotfiles are reused, seeding is skipped
+if .bootstrap_done exists.
 
 Usage:
     export ANTHROPIC_API_KEY="sk-ant-..."
@@ -26,11 +27,17 @@ Usage:
 """
 
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 
-# ── KB skill definitions ───────────────────────────────────────────────────────
+# ── constants ─────────────────────────────────────────────────────────────────
+
+MEMORY_STORE_NAME = "Institutional Memory"
+# FUSE mount path in session containers: /mnt/memory/<store-name>/
+MEMORY_MOUNT_PATH = f"/mnt/memory/{MEMORY_STORE_NAME}"
 
 SKILLS_DIR = Path("onboarding-kb-registers/skills")
 KB_DIR     = Path("onboarding-kb-registers")
@@ -53,12 +60,12 @@ SKILL_CONFIGS = [
     },
 ]
 
-# Files to write into /mnt/memory/ during the bootstrap session
+# Store-relative paths for KB tool files (seeded via API, not via agent session)
 KB_TOOL_FILES = {
-    "/mnt/memory/kb-register-schema.md":      KB_DIR / "kb-register-schema.md",
-    "/mnt/memory/tools/scaffold-registers.py": KB_DIR / "tools" / "scaffold-registers.py",
-    "/mnt/memory/tools/kb-lint.py":            KB_DIR / "tools" / "kb-lint.py",
-    "/mnt/memory/tools/kb-browser.py":         KB_DIR / "tools" / "kb-browser.py",
+    "/kb-register-schema.md":       KB_DIR / "kb-register-schema.md",
+    "/tools/scaffold-registers.py": KB_DIR / "tools" / "scaffold-registers.py",
+    "/tools/kb-lint.py":            KB_DIR / "tools" / "kb-lint.py",
+    "/tools/kb-browser.py":         KB_DIR / "tools" / "kb-browser.py",
 }
 
 SYSTEM_PROMPT = """\
@@ -71,7 +78,7 @@ expected to get sharper over time.
 
 # Knowledge base
 
-Your institutional memory lives in structured registers at `/mnt/memory/.registers/`.
+Your institutional memory lives in structured registers at `/mnt/memory/Institutional Memory/.registers/`.
 These registers survive across sessions and hold the single source of truth for
 policies, role assignments, service ownership, and more.
 
@@ -114,88 +121,48 @@ def upload_skill(client: Anthropic, cfg: dict) -> str:
     return skill.id
 
 
-def build_bootstrap_message() -> str:
+def _create_memory(client: Anthropic, store_id: str, path: str, content: str) -> None:
+    """Create a memory entry, skipping silently if the path already exists."""
+    try:
+        client.beta.memory_stores.memories.create(store_id, path=path, content=content)
+        print(f"  created  {path}")
+    except APIStatusError as e:
+        if e.status_code == 409:
+            print(f"  exists   {path}")
+        else:
+            raise
+
+
+def seed_memory_store(client: Anthropic, memory_store_id: str) -> None:
+    """Seed KB tooling and scaffold registers directly into the memory store via the API.
+
+    Files land at store-relative paths (e.g. /kb-register-schema.md).  The FUSE
+    mount makes them visible inside sessions at MEMORY_MOUNT_PATH/<path>.
     """
-    Build the user message for the one-time workspace bootstrap session.
+    print("\nSeeding KB workspace into memory store...")
 
-    Embeds every KB tool file so the agent can write them to /mnt/memory/
-    and then scaffolds the 12 register files. The bootstrap session runs once;
-    subsequent sessions find everything already in place.
-    """
-    parts = [
-        "=== KB WORKSPACE BOOTSTRAP ===\n",
-        (
-            "Write each file below to the exact path shown using your write tool. "
-            "Create parent directories as needed (e.g. mkdir -p /mnt/memory/tools). "
-            "Then scaffold the registers. Confirm each step with a brief status line.\n"
-        ),
-    ]
+    for store_path, local_path in KB_TOOL_FILES.items():
+        _create_memory(client, memory_store_id, store_path, local_path.read_text())
 
-    for dest_path, src_path in KB_TOOL_FILES.items():
-        content = src_path.read_text()
-        parts.append(f"-----  FILE: {dest_path}  -----\n{content}\n-----  END  -----\n")
-
-    parts.append(
-        "After writing all files, run:\n"
-        "  cd /mnt/memory && python3 tools/scaffold-registers.py --path .registers\n\n"
-        "When done, reply with a single line: BOOTSTRAP COMPLETE"
-    )
-
-    return "\n".join(parts)
-
-
-def run_bootstrap_session(
-    client: Anthropic,
-    agent_id: str,
-    environment_id: str,
-    memory_store_id: str,
-) -> None:
-    """Run a one-time session that writes KB tooling and scaffolds .registers/."""
-    print("\nBootstrapping KB workspace in memory store...")
-    session = client.beta.sessions.create(
-        agent=agent_id,
-        environment_id=environment_id,
-        title="Bootstrap — write KB tooling + scaffold registers",
-        resources=[
-            {
-                "type": "memory_store",
-                "memory_store_id": memory_store_id,
-                "access": "read_write",
-                "instructions": (
-                    "Write the KB tool files and scaffold the register directory "
-                    "exactly as instructed. This runs once during setup."
-                ),
-            }
-        ],
-    )
-
-    bootstrap_message = build_bootstrap_message()
-
-    with client.beta.sessions.events.stream(session.id) as stream:
-        client.beta.sessions.events.send(
-            session.id,
-            events=[
-                {
-                    "type": "user.message",
-                    "content": [{"type": "text", "text": bootstrap_message}],
-                }
-            ],
+    # Run scaffold-registers.py locally into a temp dir, then upload each file.
+    scaffold_script = KB_DIR / "tools" / "scaffold-registers.py"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registers_dir = Path(tmpdir) / ".registers"
+        subprocess.run(
+            ["python3", str(scaffold_script), "--path", str(registers_dir)],
+            check=True,
+            capture_output=True,
         )
-        for event in stream:
-            if event.type == "agent.tool_use":
-                name   = getattr(event, "name", "?")
-                inp    = getattr(event, "input", {}) or {}
-                target = inp.get("path") or inp.get("file_path") or inp.get("command") or ""
-                print(f"  [{name}]  {str(target)[:80]}", flush=True)
-            elif event.type == "agent.message":
-                for block in event.content:
-                    if getattr(block, "type", None) == "text":
-                        print(f"  agent: {block.text}", flush=True)
-            elif event.type == "session.status_idle":
-                break
+        for reg_file in sorted(registers_dir.iterdir()):
+            _create_memory(
+                client,
+                memory_store_id,
+                f"/.registers/{reg_file.name}",
+                reg_file.read_text(),
+            )
 
     Path(".bootstrap_done").write_text("1")
-    print("Bootstrap complete.")
+    print("Seed complete.")
 
 
 def main() -> None:
@@ -209,62 +176,75 @@ def main() -> None:
     skill_ids = [upload_skill(client, cfg) for cfg in SKILL_CONFIGS]
 
     # 2. Agent — created with skills attached from the start
-    print("\nCreating agent...")
-    agent = client.beta.agents.create(
-        name="EPAM Institutional Memory Agent",
-        model="claude-sonnet-4-6",
-        system=SYSTEM_PROMPT,
-        tools=[{"type": "agent_toolset_20260401"}],
-        skills=[
-            {"type": "custom", "skill_id": sid, "version": "latest"}
-            for sid in skill_ids
-        ],
-        metadata={
-            "hackathon": "partner-basecamp-2026",
-            "track": "memory-agent",
-            "partner": "EPAM Systems, Inc.",
-        },
-    )
-    Path(".agent_id").write_text(agent.id)
-    print(f"Agent created:        {agent.id}  (version {agent.version}, {len(skill_ids)} skills)")
+    agent_id_path = Path(".agent_id")
+    if agent_id_path.exists():
+        agent_id = agent_id_path.read_text().strip()
+        print(f"\nAgent:                reusing {agent_id}")
+    else:
+        print("\nCreating agent...")
+        agent = client.beta.agents.create(
+            name="EPAM Institutional Memory Agent",
+            model="claude-sonnet-4-6",
+            system=SYSTEM_PROMPT,
+            tools=[{"type": "agent_toolset_20260401"}],
+            skills=[
+                {"type": "custom", "skill_id": sid, "version": "latest"}
+                for sid in skill_ids
+            ],
+            metadata={
+                "hackathon": "partner-basecamp-2026",
+                "track": "memory-agent",
+                "partner": "EPAM Systems, Inc.",
+            },
+        )
+        agent_id = agent.id
+        agent_id_path.write_text(agent_id)
+        print(f"Agent created:        {agent_id}  (version {agent.version}, {len(skill_ids)} skills)")
 
     # 3. Environment
-    environment = client.beta.environments.create(
-        name="memory-agent-env",
-        config={
-            "type": "cloud",
-            "networking": {"type": "unrestricted"},
-        },
-    )
-    Path(".environment_id").write_text(environment.id)
-    print(f"Environment created:  {environment.id}")
+    env_id_path = Path(".environment_id")
+    if env_id_path.exists():
+        environment_id = env_id_path.read_text().strip()
+        print(f"Environment:          reusing {environment_id}")
+    else:
+        environment = client.beta.environments.create(
+            name="memory-agent-env",
+            config={
+                "type": "cloud",
+                "networking": {"type": "unrestricted"},
+            },
+        )
+        environment_id = environment.id
+        env_id_path.write_text(environment_id)
+        print(f"Environment created:  {environment_id}")
 
     # 4. Memory store
-    memory_store = client.beta.memory_stores.create(
-        name="Institutional Memory",
-        description=(
-            "Persistent KB workspace for the Institutional Memory Agent. "
-            "Contains KB tooling (tools/, scaffold-registers.py, kb-register-schema.md), "
-            "live registers (.registers/), snapshots, and memory.md summary. "
-            "Newer register entries supersede older ones on the same singleton key."
-        ),
-    )
-    Path(".memory_store_id").write_text(memory_store.id)
-    print(f"Memory store created: {memory_store.id}")
-
-    # 5. Bootstrap — write KB tooling + scaffold .registers/ into the memory store
-    if Path(".bootstrap_done").exists():
-        print("\nBootstrap already done — skipping.")
+    store_id_path = Path(".memory_store_id")
+    if store_id_path.exists():
+        memory_store_id = store_id_path.read_text().strip()
+        print(f"Memory store:         reusing {memory_store_id}")
     else:
-        run_bootstrap_session(
-            client,
-            agent_id=agent.id,
-            environment_id=environment.id,
-            memory_store_id=memory_store.id,
+        memory_store = client.beta.memory_stores.create(
+            name=MEMORY_STORE_NAME,
+            description=(
+                "Persistent KB workspace for the Institutional Memory Agent. "
+                "Contains KB tooling (tools/, scaffold-registers.py, kb-register-schema.md), "
+                "live registers (.registers/), snapshots, and memory.md summary. "
+                "Newer register entries supersede older ones on the same singleton key."
+            ),
         )
+        memory_store_id = memory_store.id
+        store_id_path.write_text(memory_store_id)
+        print(f"Memory store created: {memory_store_id}")
+
+    # 5. Seed KB tooling + .registers/ directly into the memory store via the API
+    if Path(".bootstrap_done").exists():
+        print("\nSeed already done — skipping.")
+    else:
+        seed_memory_store(client, memory_store_id=memory_store_id)
 
     print("\nSetup complete.")
-    print(f"  Memory store Console:  https://platform.claude.com/memory-stores/{memory_store.id}")
+    print(f"  Memory store Console:  https://platform.claude.com/memory-stores/{memory_store_id}")
     print(f"  Inspect memory:        python inspect_memory.py")
     print(f"  Verify skills:         python inspect_skills.py")
     print(f"\nNext:  python run_session_1.py")

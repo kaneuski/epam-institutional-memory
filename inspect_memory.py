@@ -1,65 +1,96 @@
 """
-List every memory in the agent's memory store, with content previews.
+List every file in the agent's memory store and show the first 20 lines of each.
 
-This is your demo helper — run it between sessions to see what the agent has
-chosen to remember. Great for the live demo (three terminals: session 1
-output, session 2 output, this).
+Runs a short session that executes a single bash pipeline and streams the raw
+tool output — the agent is not asked to interpret or summarise anything.
 
 Usage:
-    python inspect_memory.py              # list with previews
-    python inspect_memory.py --full       # full content of every memory
+    python inspect_memory.py
 """
 
 import os
-import sys
 from pathlib import Path
 
 from anthropic import Anthropic
+
+# One pipeline: list every file (including hidden dirs like .registers/),
+# then head each one.  The agent is told to run this exact command and nothing
+# else, so it cannot silently summarise the output.
+DISCOVER_COMMAND = r"""
+echo "=== /mnt/ ===" && ls -la /mnt/ 2>&1
+echo "=== /mnt/memory/ ===" && ls -la "/mnt/memory/" 2>&1
+"""
+
+BASH_COMMAND = r"""find /mnt/memory -mindepth 1 -type f | sort | while IFS= read -r f; do
+  printf '\n======  %s  ======\n' "$f"
+  head -20 "$f"
+done"""
+
+INSPECT_MESSAGE = (
+    f"Run each bash command below in sequence. Reply with the raw stdout only — "
+    f"no commentary, no formatting, no markdown.\n\n"
+    f"Command 1 (discover mount layout):\n```\n{DISCOVER_COMMAND}\n```\n\n"
+    f"Command 2 (dump all files):\n```\n{BASH_COMMAND}\n```"
+)
 
 
 def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("Set ANTHROPIC_API_KEY before running.")
 
-    store_id_path = Path(".memory_store_id")
-    if not store_id_path.exists():
-        raise SystemExit("Missing .memory_store_id. Run create_agent.py first.")
-    store_id = store_id_path.read_text().strip()
+    for required in (".agent_id", ".environment_id", ".memory_store_id"):
+        if not Path(required).exists():
+            raise SystemExit(f"Missing {required} — run create_agent.py first.")
 
-    full = "--full" in sys.argv
+    agent_id        = Path(".agent_id").read_text().strip()
+    environment_id  = Path(".environment_id").read_text().strip()
+    memory_store_id = Path(".memory_store_id").read_text().strip()
 
     client = Anthropic()
 
-    print(f"Memory store: {store_id}\n" + "=" * 60)
+    print(f"Memory store: {memory_store_id}")
+    print("=" * 60)
 
-    page = client.beta.memory_stores.memories.list(
-        store_id,
-        path_prefix="/",
-        order_by="path",
+    session = client.beta.sessions.create(
+        agent=agent_id,
+        environment_id=environment_id,
+        title="inspect /mnt/memory/",
+        resources=[
+            {
+                "type": "memory_store",
+                "memory_store_id": memory_store_id,
+                "access": "read_write",
+                "instructions": "Read-only inspection of /mnt/memory/.",
+            }
+        ],
     )
 
-    items = list(page.data)
-    if not items:
-        print("(memory store is empty — has run_session_1.py been run?)")
-        return
-
-    for item in items:
-        # `item.type` is "memory" for files (or "directory" for nested dirs)
-        if item.type != "memory":
-            print(f"\n[dir] {item.path}")
-            continue
-
-        retrieved = client.beta.memory_stores.memories.retrieve(
-            item.id, memory_store_id=store_id
+    with client.beta.sessions.events.stream(session.id) as stream:
+        client.beta.sessions.events.send(
+            session.id,
+            events=[
+                {
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": INSPECT_MESSAGE}],
+                }
+            ],
         )
-        content = retrieved.content or ""
-
-        print(f"\n--- {item.path}  ({len(content)} chars) ---")
-        if full:
-            print(content)
-        else:
-            preview = content[:400]
-            print(preview + ("..." if len(content) > 400 else ""))
+        for event in stream:
+            if event.type == "session.status_idle":
+                break
+            # Capture every text block from every event type — tool results,
+            # agent messages, etc. — so nothing the agent sees is filtered out.
+            for block in getattr(event, "content", None) or []:
+                btype = getattr(block, "type", None)
+                if btype == "text":
+                    text = getattr(block, "text", "")
+                    if text.strip():
+                        print(text)
+                elif btype == "tool_result":
+                    # Tool result blocks carry bash stdout directly
+                    for inner in getattr(block, "content", None) or []:
+                        if getattr(inner, "type", None) == "text":
+                            print(getattr(inner, "text", ""))
 
 
 if __name__ == "__main__":
