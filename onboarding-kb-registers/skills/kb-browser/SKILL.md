@@ -74,34 +74,54 @@ If the user cancels, stop here.
 
 ---
 
-## Step 2: Generate the HTML browser
+## Step 2: Install Mermaid CLI
+
+The HTML generator uses `mmdc` to render the relationship graph as an SVG. Install it if it isn't
+already available:
 
 ```
-python3 tools/kb-browser.py --path .registers --output kb-browser-[YYYY-MM-DD-HHMMSS].html
+npm install -g @mermaid-js/mermaid-cli
+```
+
+Verify with `mmdc --version`. If the install fails (e.g. permissions), try `npm install -g --prefix ~/.npm-global @mermaid-js/mermaid-cli` and add `~/.npm-global/bin` to `PATH` before proceeding.
+
+---
+
+## Step 3: Generate the HTML browser
+
+```
+python3 tools/kb-browser.py --path .registers --output /tmp/kb-browser-[YYYY-MM-DD-HHMMSS].html
 ```
 
 The graph is generated unconditionally every time — there's no flag for it, since there's no
 timeline-affected variant to choose between.
 
+Use a timestamp down to the second (e.g. `2026-06-24-153045`), not just the date — this skill can run
+several times in one day while iterating on registers, and a date-only filename would silently
+overwrite the previous run's snapshot instead of leaving a trail of them.
+
 If the command fails, surface the error output and stop.
 
 ---
 
-## Step 3: Open in browser
+## Step 4: Upload the HTML as a session output file
 
+Upload the generated file so it is retrievable via the files API after the session ends:
+
+```python
+import anthropic, pathlib
+
+path = "/tmp/kb-browser-[YYYY-MM-DD-HHMMSS].html"
+client = anthropic.Anthropic()
+with open(path, "rb") as f:
+    result = client.beta.files.create(
+        file=(pathlib.Path(path).name, f, "text/html"),
+        betas=["managed-agents-2026-04-01"],
+    )
+print(f"UPLOADED: {result.id}  {result.filename}")
 ```
-open kb-browser-[YYYY-MM-DD-HHMMSS].html 2>/dev/null || xdg-open kb-browser-[YYYY-MM-DD-HHMMSS].html 2>/dev/null || start kb-browser-[YYYY-MM-DD-HHMMSS].html 2>/dev/null || echo "OPEN_FAILED"
-```
 
-- If the command succeeds (no `OPEN_FAILED`), tell the user: "KB browser opened — saved to
-  `kb-browser-[date-time].html`. Drag the slider at the top to see how the registers looked on any past
-  date; switch to the Graph item in the sidebar for the current relationship map."
-- If `OPEN_FAILED`, tell the user: "Generated `kb-browser-[date-time].html` — could not open
-  automatically. Open it manually in your browser."
-
-Use a timestamp down to the second (e.g. `2026-06-24-153045`), not just the date — this skill can run
-several times in one day while iterating on registers, and a date-only filename would silently
-overwrite the previous run's snapshot instead of leaving a trail of them.
+If the upload fails, surface the error and stop.
 
 ---
 

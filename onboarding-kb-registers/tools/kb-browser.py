@@ -605,7 +605,7 @@ def generate_html(registers: list, output_path: Path):
 '''
 
     mermaid_content = build_mermaid(registers)
-    graph_svg = _render_mermaid_to_svg(mermaid_content)
+    mermaid_pre = f'<pre class="mermaid">{html.escape(mermaid_content)}</pre>'
     graph_panel = f'''<div id="graph-panel" style="display:none; flex-direction:column; background:#fff; flex:1; min-height:0;">
   <div class="graph-toolbar">
     <button class="graph-zoom-btn" id="graph-zoom-out" title="Zoom out">&#8722;</button>
@@ -615,7 +615,7 @@ def generate_html(registers: list, output_path: Path):
   </div>
   <div id="graph-scroll" style="flex:1; min-height:0; overflow:auto; padding:1rem;">
     <div id="graph-zoom-wrap" style="transform-origin: 0 0; display:inline-block;">
-{graph_svg}
+{mermaid_pre}
     </div>
   </div>
 </div>'''
@@ -626,6 +626,7 @@ def generate_html(registers: list, output_path: Path):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Onboarding KB Register Browser</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; height: 100vh; background: #f8f9fa; color: #2c3e50; }}
@@ -775,6 +776,7 @@ th.rm-td {{ background:#f0f0f0; font-weight:600; }}
 </div>
 
 <script>
+mermaid.initialize({{ startOnLoad: false, theme: 'neutral' }});
 const allEntries = {entries_json};
 const allRegisters = {registers_json};
 const timelineDates = {timeline_json};
@@ -956,7 +958,28 @@ function showGraph() {{
   document.querySelectorAll('.reg-item').forEach(i => i.classList.remove('active'));
   var nav = document.getElementById('graph-nav-item');
   if (nav) nav.classList.add('active');
-  wireGraphNodes();
+  if (!gp._mermaidRendered) {{
+    gp._mermaidRendered = true;
+    mermaid.run({{ nodes: document.querySelectorAll('#graph-panel .mermaid') }}).then(function() {{
+      var svg = gp.querySelector('svg');
+      if (svg) {{
+        var vb = svg.getAttribute('viewBox');
+        if (vb) {{
+          var parts = vb.trim().split(/[\s,]+/);
+          if (parts.length === 4) {{
+            var w = Math.round(parseFloat(parts[2]));
+            var h = Math.round(parseFloat(parts[3]));
+            svg.style.maxWidth = 'none';
+            svg.setAttribute('width', w);
+            svg.setAttribute('height', h);
+          }}
+        }}
+      }}
+      wireGraphNodes();
+    }});
+  }} else {{
+    wireGraphNodes();
+  }}
 }}
 
 document.getElementById('reg-file-btn').addEventListener('click', function() {{
@@ -1022,11 +1045,11 @@ function wireGraphNodes() {{
   var zoomResetBtn = document.getElementById('graph-zoom-reset');
 
   if (zoomInBtn) zoomInBtn.addEventListener('click', function() {{
-    zoomLevel = Math.min(3, Math.round((zoomLevel + 0.2) * 100) / 100);
+    zoomLevel = Math.min(8, Math.round((zoomLevel + 0.5) * 100) / 100);
     applyZoom();
   }});
   if (zoomOutBtn) zoomOutBtn.addEventListener('click', function() {{
-    zoomLevel = Math.max(0.2, Math.round((zoomLevel - 0.2) * 100) / 100);
+    zoomLevel = Math.max(0.1, Math.round((zoomLevel - 0.5) * 100) / 100);
     applyZoom();
   }});
   if (zoomResetBtn) zoomResetBtn.addEventListener('click', function() {{
