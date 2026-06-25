@@ -21,7 +21,6 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
-
 SYSTEM_PROMPT = """\
 You are the Institutional Memory Agent for a fast-growing company.
 
@@ -66,11 +65,15 @@ def main() -> None:
 
     # 1. Agent
     agent = client.beta.agents.create(
-        name="Institutional Memory Agent",
+        name="EPAM Institutional Memory Agent",
         model="claude-sonnet-4-6",
         system=SYSTEM_PROMPT,
         tools=[{"type": "agent_toolset_20260401"}],
-        metadata={"hackathon": "partner-basecamp-2026", "track": "memory-agent"},
+        metadata={
+            "hackathon": "partner-basecamp-2026",
+            "track": "memory-agent",
+            "partner": "EPAM Systems, Inc.",
+        },
     )
     Path(".agent_id").write_text(agent.id)
     print(f"Agent created:        {agent.id}")
