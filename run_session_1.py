@@ -1,12 +1,11 @@
 """
-Session 1 — Baseline.
+Session 1 — ingest round 1 baseline documents into the KB registers.
 
-Starts a Managed Agents session with the memory store ATTACHED so the agent
-can read and write /mnt/memory/. Inlines the round1 docs in the user message.
+Assumes create_agent.py has already bootstrapped /mnt/memory/ with KB tooling
+and an empty .registers/ directory.
 
-After this session, inspect the memory store to see what the agent saved:
-    python inspect_memory.py
-or in the Console UI under Memory Stores.
+The agent uses the kb-updater skill to classify each document and write
+structured entries into /mnt/memory/.registers/.
 
 Usage:
     python run_session_1.py
@@ -17,18 +16,17 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
+DOCS_DIR      = Path("synthetic-data/round1")
+SESSION_TITLE = "Session 1 — KB ingestion: round 1 baseline"
 
-TEST_QUESTION = (
-    "I just joined the company and I need read-only prod access to debug an "
-    "issue tomorrow. What do I do? Be specific about the steps and the people "
-    "I need to talk to."
+INGEST_PREAMBLE = (
+    "Below are the company's baseline onboarding documents (round 1). "
+    "Please ingest each one into the KB registers at /mnt/memory/.registers/ "
+    "using the kb-updater skill. Work from /mnt/memory/ as your base directory."
 )
 
-DOCS_DIR = Path("synthetic-data/round1")
-OUTPUT_DIR = Path("outputs")
 
-
-def load_docs_as_context(docs_dir: Path) -> str:
+def load_docs(docs_dir: Path) -> str:
     blocks = []
     for path in sorted(docs_dir.glob("*.md")):
         print(f"  including {path.name}")
@@ -42,49 +40,38 @@ def main() -> None:
 
     for required in (".agent_id", ".environment_id", ".memory_store_id"):
         if not Path(required).exists():
-            raise SystemExit(f"Missing {required}. Run create_agent.py first.")
+            raise SystemExit(f"Missing {required} — run create_agent.py first.")
 
-    agent_id = Path(".agent_id").read_text().strip()
-    environment_id = Path(".environment_id").read_text().strip()
+    agent_id        = Path(".agent_id").read_text().strip()
+    environment_id  = Path(".environment_id").read_text().strip()
     memory_store_id = Path(".memory_store_id").read_text().strip()
 
     client = Anthropic()
 
-    print(f"Loading round1 docs from {DOCS_DIR}/...")
-    context = load_docs_as_context(DOCS_DIR)
+    print(f"Loading docs from {DOCS_DIR}/...")
+    context = load_docs(DOCS_DIR)
 
-    print(f"\nStarting session with memory store {memory_store_id} attached...")
+    print(f"\nStarting session with memory store {memory_store_id}...")
     session = client.beta.sessions.create(
         agent=agent_id,
         environment_id=environment_id,
-        title="Session 1 — baseline",
+        title=SESSION_TITLE,
         resources=[
             {
                 "type": "memory_store",
                 "memory_store_id": memory_store_id,
                 "access": "read_write",
                 "instructions": (
-                    "This is your persistent institutional memory. Mounted at "
-                    "/mnt/memory/. Check it before starting. Record what you "
-                    "learn for future sessions."
+                    "Persistent KB workspace at /mnt/memory/. Contains KB tooling "
+                    "(tools/, scaffold-registers.py, kb-register-schema.md) and live "
+                    "registers at .registers/. Tools are under tools/. Always check this at session start."
                 ),
             }
         ],
     )
 
-    user_message = (
-        "I'm including our onboarding and policy documents below. Please:\n"
-        "1. First, check your memory store at /mnt/memory/ to see what you've "
-        "learned in previous sessions.\n"
-        "2. Then read the documents below.\n"
-        "3. Then answer the question.\n"
-        "4. Before you finish, save anything worth remembering to /mnt/memory/.\n\n"
-        f"{context}\n\n"
-        "==================================================\n"
-        f"QUESTION: {TEST_QUESTION}"
-    )
+    user_message = f"{INGEST_PREAMBLE}\n\n{context}"
 
-    final_text_parts: list[str] = []
     print("\nAgent working...\n")
     with client.beta.sessions.events.stream(session.id) as stream:
         client.beta.sessions.events.send(
@@ -100,12 +87,10 @@ def main() -> None:
             if event.type == "agent.message":
                 for block in event.content:
                     if getattr(block, "type", None) == "text":
-                        final_text_parts.append(block.text)
                         print(block.text, end="", flush=True)
             elif event.type == "agent.tool_use":
-                # Show file ops on /mnt/memory/ in particular — that's the demo
-                name = getattr(event, "name", "?")
-                inp = getattr(event, "input", {}) or {}
+                name   = getattr(event, "name", "?")
+                inp    = getattr(event, "input", {}) or {}
                 target = inp.get("path") or inp.get("file_path") or inp.get("command") or ""
                 if "/mnt/memory" in str(target):
                     print(f"\n  [memory: {name}  {target}]", flush=True)
@@ -115,15 +100,8 @@ def main() -> None:
                 print("\n\n[agent finished]")
                 break
 
-    final_text = "".join(final_text_parts)
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    out = OUTPUT_DIR / "session1.txt"
-    out.write_text(
-        f"=== SESSION 1 ===\nQuestion: {TEST_QUESTION}\n\n--- ANSWER ---\n{final_text}\n"
-    )
-    print(f"\nSaved to {out}")
-    print(f"\nInspect what the agent remembered:  python inspect_memory.py")
-    print(f"Then run run_session_2.py.")
+    print(f"Inspect registers:  python inspect_memory.py")
+    print(f"Next:               python run_session_2.py")
 
 
 if __name__ == "__main__":

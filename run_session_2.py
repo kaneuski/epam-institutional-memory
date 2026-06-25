@@ -1,12 +1,12 @@
 """
-Session 2 — After memory + new context.
+Session 2 — ingest round 2 updates into the KB registers.
 
-Same agent, same memory store, fresh session. Round2 docs contradict round1.
-The agent should:
-- Read memory first (`/mnt/memory/`)
-- Notice the contradictions in the new docs
-- UPDATE memory rather than appending
-- Lead its answer with what changed and why
+Assumes create_agent.py has already bootstrapped /mnt/memory/ and session 1
+has populated /mnt/memory/.registers/ with round 1 entries.
+
+The agent uses the kb-updater skill to apply supersessions: new policy entries
+replace old ones, role and service ownership changes flip existing entries to
+former/superseded and create new current ones.
 
 Usage:
     python run_session_2.py
@@ -17,19 +17,20 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
+DOCS_DIR      = Path("synthetic-data/round2")
+SESSION_TITLE = "Session 2 — KB ingestion: round 2 updates"
 
-# Match session 1
-TEST_QUESTION = (
-    "I just joined the company and I need read-only prod access to debug an "
-    "issue tomorrow. What do I do? Be specific about the steps and the people "
-    "I need to talk to."
+INGEST_PREAMBLE = (
+    "Below are updated company documents (round 2) that contradict some round 1 entries. "
+    "Please ingest each one into the KB registers at /mnt/memory/.registers/ "
+    "using the kb-updater skill. Work from /mnt/memory/ as your base directory. "
+    "For singleton registers (policies, role-assignments, service-ownership), run the "
+    "supersede algorithm: flip the old entry to former/superseded, create the new current "
+    "entry, add bidirectional References links, and propagate any stale pointers."
 )
 
-DOCS_DIR = Path("synthetic-data/round2")
-OUTPUT_DIR = Path("outputs")
 
-
-def load_docs_as_context(docs_dir: Path) -> str:
+def load_docs(docs_dir: Path) -> str:
     blocks = []
     for path in sorted(docs_dir.glob("*.md")):
         print(f"  including {path.name}")
@@ -43,54 +44,39 @@ def main() -> None:
 
     for required in (".agent_id", ".environment_id", ".memory_store_id"):
         if not Path(required).exists():
-            raise SystemExit(f"Missing {required}. Run create_agent.py first.")
+            raise SystemExit(f"Missing {required} — run create_agent.py first.")
 
-    agent_id = Path(".agent_id").read_text().strip()
-    environment_id = Path(".environment_id").read_text().strip()
+    agent_id        = Path(".agent_id").read_text().strip()
+    environment_id  = Path(".environment_id").read_text().strip()
     memory_store_id = Path(".memory_store_id").read_text().strip()
 
     client = Anthropic()
 
-    print(f"Loading round2 docs from {DOCS_DIR}/...")
-    context = load_docs_as_context(DOCS_DIR)
+    print(f"Loading docs from {DOCS_DIR}/...")
+    context = load_docs(DOCS_DIR)
 
-    print(f"\nStarting fresh session with same memory store {memory_store_id}...")
+    print(f"\nStarting session with memory store {memory_store_id}...")
     session = client.beta.sessions.create(
         agent=agent_id,
         environment_id=environment_id,
-        title="Session 2 — after memory + new context",
+        title=SESSION_TITLE,
         resources=[
             {
                 "type": "memory_store",
                 "memory_store_id": memory_store_id,
                 "access": "read_write",
                 "instructions": (
-                    "This is your persistent institutional memory. Some entries "
-                    "may be out of date — reconcile against the new documents in "
-                    "this session and UPDATE existing entries (don't just append)."
+                    "Persistent KB workspace at /mnt/memory/. Contains KB tooling "
+                    "(tools/, scaffold-registers.py, kb-register-schema.md) and live "
+                    "registers at .registers/ populated in a previous session. "
+                    "Supersede stale entries — do not just append."
                 ),
             }
         ],
     )
 
-    user_message = (
-        "I'm including some updated and new documents below. Some of them "
-        "contradict things you learned in our previous session.\n\n"
-        "Please:\n"
-        "1. First, check your memory store at /mnt/memory/ to see what you "
-        "already know.\n"
-        "2. Read the new documents below.\n"
-        "3. Reconcile conflicts — UPDATE memory entries to reflect the "
-        "newer information. Note dates.\n"
-        "4. Answer the question.\n"
-        "5. If your answer differs from your previous answer, lead with what "
-        "changed and why.\n\n"
-        f"{context}\n\n"
-        "==================================================\n"
-        f"QUESTION: {TEST_QUESTION}"
-    )
+    user_message = f"{INGEST_PREAMBLE}\n\n{context}"
 
-    final_text_parts: list[str] = []
     print("\nAgent working...\n")
     with client.beta.sessions.events.stream(session.id) as stream:
         client.beta.sessions.events.send(
@@ -106,11 +92,10 @@ def main() -> None:
             if event.type == "agent.message":
                 for block in event.content:
                     if getattr(block, "type", None) == "text":
-                        final_text_parts.append(block.text)
                         print(block.text, end="", flush=True)
             elif event.type == "agent.tool_use":
-                name = getattr(event, "name", "?")
-                inp = getattr(event, "input", {}) or {}
+                name   = getattr(event, "name", "?")
+                inp    = getattr(event, "input", {}) or {}
                 target = inp.get("path") or inp.get("file_path") or inp.get("command") or ""
                 if "/mnt/memory" in str(target):
                     print(f"\n  [memory: {name}  {target}]", flush=True)
@@ -120,15 +105,7 @@ def main() -> None:
                 print("\n\n[agent finished]")
                 break
 
-    final_text = "".join(final_text_parts)
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    out = OUTPUT_DIR / "session2.txt"
-    out.write_text(
-        f"=== SESSION 2 ===\nQuestion: {TEST_QUESTION}\n\n--- ANSWER ---\n{final_text}\n"
-    )
-    print(f"\nSaved to {out}")
-    print(f"\nDiff outputs/session1.txt and outputs/session2.txt — the demo lives there.")
-    print(f"Inspect updated memory:  python inspect_memory.py")
+    print(f"Inspect registers:  python inspect_memory.py")
 
 
 if __name__ == "__main__":
